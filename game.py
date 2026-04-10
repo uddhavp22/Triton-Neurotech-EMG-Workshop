@@ -14,7 +14,8 @@ FPS      = 60
 class Player:
     W, H     = 34, 48
     JUMP_VEL = -14.5
-    GRAVITY  = 0.98
+    GRAVITY  = 0.34
+
 
     def __init__(self):
         self.x: float = 100.0

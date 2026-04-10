@@ -18,13 +18,12 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSizePolicy, QFrame, QSlider, QLineEdit, QSpacerItem,
-    QAbstractSlider,
+    QSizePolicy, QFrame, QSlider, QLineEdit,
 )
-from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPainterPath,
-    QLinearGradient, QKeyEvent,
+    QKeyEvent,
 )
 import pyqtgraph as pg
 
@@ -191,11 +190,11 @@ def probe_channel_metrics(emg: EMGInput, settle_s: float = 0.5,
     return metrics
 
 
-def choose_default_channel(metrics: list[tuple[float, float]], n_ch: int) -> int:
-    reasonable = [(i, p) for i, (m, p) in enumerate(metrics) if 1.0 <= p <= 60.0]
+def choose_default_channel(metrics: list[tuple[float, float]], n_ch: int) -> int:  # noqa: ARG001
+    reasonable = [(i, p) for i, (_, p) in enumerate(metrics) if 1.0 <= p <= 60.0]
     if reasonable:
         return min(reasonable, key=lambda x: x[1])[0]
-    nonflat = [(i, p) for i, (m, p) in enumerate(metrics) if p > 1.0]
+    nonflat = [(i, p) for i, (_, p) in enumerate(metrics) if p > 1.0]
     if nonflat:
         return min(nonflat, key=lambda x: x[1])[0]
     return 0
