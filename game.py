@@ -100,7 +100,7 @@ class Obstacle:
 
 
 class EMGSidebar:
-    """Right-side panel showing vertical activation bar and trigger state."""
+    """Right-side panel showing EMG activation and trigger state."""
 
     def __init__(self):
         self.x = SIDEBAR_X

@@ -18,7 +18,8 @@ import time
 import threading
 import numpy as np
 
-DISPLAY_SECS = 5  # how many seconds to keep in the display ring buffer
+DISPLAY_SECS = 5      # seconds of history in the display ring buffer
+MAX_CHANNELS  = 8     # hard cap — UI supports up to 8 channels
 
 try:
     from pylsl import StreamInlet, resolve_byprop, resolve_streams, proc_clocksync, proc_dejitter
@@ -53,6 +54,7 @@ class EMGInput:
 
         self._pending_buf: np.ndarray | None = None
         self._pending_lock = threading.Lock()
+        self._channel_indices: list[int] = []
 
         # LSL state
         self._lsl_inlet = None
@@ -136,7 +138,7 @@ class EMGInput:
         try:
             stream = self._resolve_lsl_stream()
             if stream is None:
-                print("[EMGInput] No MindRove LSL stream found.")
+                print("[EMGInput] No LSL stream found.")
                 return False
 
             self._lsl_inlet = StreamInlet(
@@ -144,7 +146,13 @@ class EMGInput:
                 max_buflen=DISPLAY_SECS + 1,
                 processing_flags=proc_clocksync | proc_dejitter,
             )
-            self.emg_channels = list(range(int(stream.channel_count())))
+            total_channels = int(stream.channel_count())
+            # Expose ALL channels from the stream (up to MAX_CHANNELS).
+            # MindRove Connect may include non-EMG channels at index 0 — we show
+            # everything and let the user pick the right channel via the UI selector.
+            n_ch = min(total_channels, MAX_CHANNELS)
+            self._channel_indices = list(range(n_ch))
+            self.emg_channels = list(range(n_ch))
             self.sampling_rate = int(stream.nominal_srate()) if stream.nominal_srate() > 0 else 500
             self.synthetic = False
             self.backend = "lsl"
@@ -155,13 +163,10 @@ class EMGInput:
             self._acq_thread = threading.Thread(target=self._lsl_loop, daemon=True)
             self._acq_thread.start()
 
-            # Drain any already-buffered startup chunk.
-            time.sleep(0.05)
-            self.pull()
-            print(
-                f"[EMGInput] Connected via LSL — {self.n_channels} ch @ "
-                f"{self.sampling_rate} Hz from {self.source_name}"
-            )
+            # Let a short buffer fill, then report which channels have signal.
+            time.sleep(0.3)
+            self.pull()   # drain stale startup data
+            self._print_channel_report()
             return True
         except Exception as e:
             print(f"[EMGInput] LSL connection failed: {e}")
@@ -176,7 +181,10 @@ class EMGInput:
             self.board = BoardShim(self.board_id, params)
             self.board.prepare_session()
             self.board.start_stream()
-            self.emg_channels = list(BoardShim.get_emg_channels(self.board_id))
+            sdk_emg = list(BoardShim.get_emg_channels(self.board_id))
+            # Cap to MAX_CHANNELS but keep the SDK's correct channel indices
+            self._channel_indices = sdk_emg[:MAX_CHANNELS]
+            self.emg_channels = list(range(len(self._channel_indices)))
             self.sampling_rate = int(BoardShim.get_sampling_rate(self.board_id))
             self.synthetic = False
             self.backend = "sdk"
@@ -187,9 +195,9 @@ class EMGInput:
             self._acq_thread = threading.Thread(target=self._sdk_loop, daemon=True)
             self._acq_thread.start()
 
-            time.sleep(0.05)
+            time.sleep(0.3)
             self.pull()
-            print(f"[EMGInput] Connected via SDK — {self.n_channels} ch @ {self.sampling_rate} Hz")
+            self._print_channel_report()
             return True
         except Exception as e:
             print(f"[EMGInput] SDK connection failed: {e}")
@@ -201,7 +209,22 @@ class EMGInput:
             self.board = None
             return False
 
+    def _print_channel_report(self):
+        """Print per-channel RMS to help identify which channels have real signal."""
+        disp = self.peek()
+        print(f"[EMGInput] Connected via {self.backend} — "
+              f"{self.n_channels} ch @ {self.sampling_rate} Hz  ({self.source_name})")
+        print("[EMGInput] Channel signal levels (higher = more signal):")
+        for i in range(self.n_channels):
+            rms = float(np.sqrt(np.mean(disp[i] ** 2))) if disp.shape[1] > 0 else 0.0
+            bar = "█" * min(20, int(rms / 5))
+            flag = "  ← try this" if rms > 10 else ""
+            print(f"           CH{i+1} (idx {self._channel_indices[i]:2d}): "
+                  f"{rms:6.1f} µV  {bar}{flag}")
+        print("[EMGInput] Use keys 1-8 or click CH buttons to select the active channel.")
+
     def _start_synthetic(self):
+        self._channel_indices = list(range(4))
         self.emg_channels = list(range(4))
         self.sampling_rate = 500
         self.synthetic = True
@@ -301,8 +324,8 @@ class EMGInput:
             else:
                 arr = arr.T
 
-            if arr.shape[0] >= self.n_channels:
-                self._append_chunk(arr[:self.n_channels, :])
+            if self._channel_indices and arr.shape[0] > max(self._channel_indices):
+                self._append_chunk(arr[self._channel_indices, :])
 
     def _sdk_loop(self):
         idle_sleep = 0.005
@@ -317,7 +340,7 @@ class EMGInput:
                 time.sleep(idle_sleep)
                 continue
 
-            valid = [ch for ch in self.emg_channels if ch < raw.shape[0]]
+            valid = [ch for ch in self._channel_indices if ch < raw.shape[0]]
             if valid:
                 self._append_chunk(raw[valid, :])
 

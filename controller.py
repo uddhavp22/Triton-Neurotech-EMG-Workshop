@@ -3,9 +3,9 @@ controller.py
 Converts activation scalar + threshold into clean trigger events.
 
 Implements:
-- Threshold crossing detection (activation > threshold)
-- Refractory period (debounce): ignores re-triggers for N ms after a trigger
-- Hysteresis: requires signal to drop below (threshold * release_ratio) before re-arming
+- sustained threshold crossing detection
+- refractory period (debounce): ignores re-triggers for N ms after a trigger
+- hysteresis: requires signal to drop below (threshold * release_ratio) before re-arming
 """
 
 import time
@@ -24,14 +24,16 @@ class TriggerController:
     """
 
     def __init__(self, threshold: float = 50.0, refractory_ms: int = 300,
-                 release_ratio: float = 0.7):
+                 release_ratio: float = 0.7, hold_ms: int = 70):
         self.threshold = threshold
         self.refractory_ms = refractory_ms
         self.release_ratio = release_ratio
+        self.hold_ms = hold_ms
 
         self._last_trigger_time: float = 0.0
         self._armed: bool = True        # ready to fire
         self._triggered: bool = False   # single-frame trigger flag
+        self._above_since: float | None = None
 
     def update(self, activation: float) -> bool:
         """
@@ -47,12 +49,24 @@ class TriggerController:
         if not self._armed:
             if activation < self.threshold * self.release_ratio:
                 self._armed = True
+                self._above_since = None
 
-        # Fire if armed, above threshold, and outside refractory period
-        if self._armed and refractory_elapsed and activation >= self.threshold:
+        if activation >= self.threshold:
+            if self._above_since is None:
+                self._above_since = now
+        else:
+            self._above_since = None
+
+        # Fire only if the signal has stayed above threshold long enough.
+        held_long_enough = (
+            self._above_since is not None and
+            (now - self._above_since) * 1000 >= self.hold_ms
+        )
+        if self._armed and refractory_elapsed and held_long_enough:
             self._triggered = True
             self._last_trigger_time = now
             self._armed = False  # disarm until signal drops
+            self._above_since = None
 
         return self._triggered
 
@@ -64,6 +78,7 @@ class TriggerController:
         self._last_trigger_time = 0.0
         self._armed = True
         self._triggered = False
+        self._above_since = None
 
     def set_threshold(self, threshold: float):
         self.threshold = max(1.0, threshold)

@@ -47,9 +47,9 @@ CH_COLORS = [
     (200, 200, 200),  # CH8 light grey
 ]
 
-CAL_DURATION_S = 4
-DISPLAY_N = 500 * 4   # 4 seconds of display samples
-DISABLED_CHANNELS = {1}  # CH2 has unstable/noisy data on this workshop rig
+CAL_DURATION_S = 10
+DISPLAY_SECS_UI = 2.0
+DISABLED_CHANNELS: set[int] = set()
 
 
 # ── Fonts ──────────────────────────────────────────────────────────────────────
@@ -99,6 +99,54 @@ def draw_label(surf, text, x, y, font, color=DIM, anchor='left'):
     return t.get_width()
 
 
+def probe_channel_metrics(emg: EMGInput, settle_s: float = 0.5, window_s: float = 0.6) -> list[tuple[float, float]]:
+    """
+    Return per-channel (mean_abs, p95_abs) from a short rest window.
+    Uses a long-term mean for DC removal — NOT per-window median which zeroes signal.
+    """
+    time.sleep(settle_s)
+    n = max(64, int(emg.sampling_rate * window_s))
+    disp = emg.peek(n)
+    metrics: list[tuple[float, float]] = []
+    for ch in range(emg.n_channels):
+        if disp.shape[1] == 0:
+            metrics.append((0.0, 0.0))
+            continue
+        sig = np.asarray(disp[ch], dtype=float)
+        dc = float(np.mean(sig))          # long-window mean as DC estimate
+        abs_sig = np.abs(sig - dc)
+        mean_abs = float(np.mean(abs_sig))
+        p95_abs  = float(np.percentile(abs_sig, 95))
+        metrics.append((mean_abs, p95_abs))
+    return metrics
+
+
+def choose_default_channel(metrics: list[tuple[float, float]], n_channels: int) -> int:
+    """
+    Prefer a channel that is neither flatlined nor wildly noisy at rest.
+    Falls back safely if no channel fits the heuristic.
+    """
+    reasonable = [
+        (idx, mean_abs, p95_abs)
+        for idx, (mean_abs, p95_abs) in enumerate(metrics)
+        if 1.0 <= p95_abs <= 60.0
+    ]
+    if reasonable:
+        reasonable.sort(key=lambda item: (item[2], item[1]))
+        return reasonable[0][0]
+
+    nonflat = [
+        (idx, mean_abs, p95_abs)
+        for idx, (mean_abs, p95_abs) in enumerate(metrics)
+        if p95_abs > 1.0
+    ]
+    if nonflat:
+        nonflat.sort(key=lambda item: item[2])
+        return nonflat[0][0]
+
+    return 0 if n_channels > 0 else 0
+
+
 # ── Multi-channel EMG plot ─────────────────────────────────────────────────────
 class MultiChannelPlot:
     """
@@ -133,14 +181,18 @@ class MultiChannelPlot:
     def _draw_channel(self, surf, signal: np.ndarray, rect: pygame.Rect,
                       color: tuple, threshold: float, label: str,
                       is_active: bool, font):
-        # Auto-scale: use 99th percentile of non-zero values
-        nonzero = np.abs(signal[signal != 0.0])
-        if len(nonzero) > 10:
-            scale = max(30.0, float(np.percentile(nonzero, 99)) * 2.2)
-        else:
-            scale = 150.0
+        centered = np.asarray(signal, dtype=float)
+        if centered.size > 0:
+            centered = centered - float(np.median(centered))
 
-        n = len(signal)
+        # Auto-scale on centered data so the trace looks like the MindRove waveform.
+        nonzero = np.abs(centered[np.abs(centered) > 1e-9])
+        if len(nonzero) > 10:
+            scale = max(25.0, float(np.percentile(nonzero, 98)) * 1.35)
+        else:
+            scale = 80.0
+
+        n = len(centered)
         mid_y = rect.centery
 
         # Center line
@@ -153,7 +205,7 @@ class MultiChannelPlot:
             pts = []
             for i in indices:
                 sx = rect.x + int(i * rect.w / n)
-                sv = float(signal[i])
+                sv = float(centered[i])
                 sy = int(mid_y - (sv / scale) * (rect.h // 2 - 3))
                 sy = max(rect.top + 1, min(rect.bottom - 1, sy))
                 pts.append((sx, sy))
@@ -175,13 +227,13 @@ class MultiChannelPlot:
         draw_label(surf, label, rect.x + 6, rect.y + 4, font, lbl_color)
 
         # Scale hint (dimmed)
-        draw_label(surf, f"±{scale/2:.0f}µV", rect.right - 6, rect.y + 4,
+        draw_label(surf, f"±{scale:.0f}µV", rect.right - 6, rect.y + 4,
                    font, BORDER, anchor='right')
 
 
 # ── Activation bar ─────────────────────────────────────────────────────────────
 class ActivationBar:
-    """Horizontal bar showing smoothed EMG activation vs threshold."""
+    """Horizontal bar showing EMG activation vs threshold."""
 
     def __init__(self, x, y, w, h):
         self.rect = pygame.Rect(x, y, w, h)
@@ -283,7 +335,7 @@ class Button:
 class CalibrationScreen:
     SLIDER_MIN = 5.0
     SLIDER_MAX = 600.0
-    STEPS = ["Instructions", "Record REST", "Record FLEX", "Set Threshold"]
+    STEPS = ["Instructions", "Record REST", "Record FLEX", "Review Threshold"]
 
     def __init__(self, surf, fonts, emg: EMGInput, proc: EMGProcessor,
                  cal: Calibration, ctrl: TriggerController):
@@ -310,6 +362,7 @@ class CalibrationScreen:
         self.step = 0
         self._recording = False
         self._progress = 0.0
+        self._kind = ""
 
     # step 0→1 on first SPACE: auto-advance to rest recording
     def handle_event(self, event):
@@ -356,6 +409,13 @@ class CalibrationScreen:
         self.ctrl.set_threshold(thr)
 
     def _start_record(self, kind: str):
+        if kind == 'rest':
+            self.step = 1
+            self.cal.reset()
+            self.ctrl.reset()
+        else:
+            self.step = 2
+
         self._recording = True
         self._progress = 0.0
         self._kind = kind
@@ -400,9 +460,8 @@ class CalibrationScreen:
         self.ch_sel.draw(s, active_ch, self.fonts)
 
         # ── 4-channel EMG plot ──
-        disp = self.emg.peek(DISPLAY_N)
-        self.plot.draw(s, disp, self.cal.threshold if self.cal.is_calibrated() else 0.0,
-                       active_ch, self.fonts)
+        disp = self.emg.peek(int(self.emg.sampling_rate * DISPLAY_SECS_UI))
+        self.plot.draw(s, disp, 0.0, active_ch, self.fonts)
 
         # ── Activation bar ──
         draw_label(s, "ACTIVATION", 30, 314, self.fonts['tiny'], DIM)
@@ -423,15 +482,17 @@ class CalibrationScreen:
 
         if self.step == 0:
             lines = [
-                ("Calibration takes ~10 seconds.", TEXT),
+                ("Calibration takes 20 seconds total.", TEXT),
                 (f"Step 1: Relax arm  ({CAL_DURATION_S}s of rest signal)", DIM),
                 (f"Step 2: Flex arm   ({CAL_DURATION_S}s of flex signal)", DIM),
-                ("Step 3: Adjust threshold slider.", DIM),
+                ("Step 3: Review activation threshold.", DIM),
             ]
             for i, (line, color) in enumerate(lines):
                 draw_label(s, line, SCREEN_W // 2, cy + i * 30, self.fonts['small'],
                            color, anchor='center')
-            self._draw_big_button("SPACE  →  Start Calibration", cy + 140)
+            draw_label(s, "Press SPACE and the screen will switch to REST recording immediately.",
+                       SCREEN_W // 2, cy + 118, self.fonts['tiny'], BORDER, anchor='center')
+            self._draw_big_button("SPACE  →  Start REST Recording", cy + 140)
 
         elif self.step in (1, 2):
             kind = self._kind.upper() if self._kind else ("REST" if self.step == 1 else "FLEX")
@@ -456,23 +517,31 @@ class CalibrationScreen:
                 msg = "Relax your forearm completely." if next_kind == 'REST' else "Flex your forearm firmly."
                 color = RED if next_kind == 'REST' else GREEN
                 draw_label(s, msg, SCREEN_W // 2, cy, self.fonts['small'], color, anchor='center')
+                draw_label(
+                    s,
+                    "Press SPACE once to begin the highlighted recording phase.",
+                    SCREEN_W // 2,
+                    cy + 28,
+                    self.fonts['tiny'],
+                    BORDER,
+                    anchor='center',
+                )
                 self._draw_big_button(f"SPACE  →  Record {next_kind}", cy + 50)
 
         elif self.step == 3:
             # Threshold slider
             thr = self.cal.threshold
-            draw_label(s, f"Threshold:  {thr:.1f} µV", 180, cy - 26,
+            draw_label(s, f"Activation threshold:  {thr:.1f} µV", 180, cy - 26,
                        self.fonts['small'], TEXT)
-            draw_label(s, "drag to adjust →", SCREEN_W - 180, cy - 26,
+            draw_label(s, "drag to adjust threshold →", SCREEN_W - 180, cy - 26,
                        self.fonts['tiny'], DIM, anchor='right')
 
             sr = self.slider_rect
             draw_panel(s, sr, radius=sr.h // 2, color=PANEL2)
 
-            # Rest / flex markers
-            rest_m = self.cal.rest_mean
-            flex_m = self.cal.flex_mean
-            max_v = max(self.SLIDER_MAX, flex_m * 1.2)
+            # REST / FLEX markers
+            rest_m = self.cal.rest_p99
+            flex_m = self.cal.flex_p25
 
             def slider_x(v):
                 r = (v - self.SLIDER_MIN) / (self.SLIDER_MAX - self.SLIDER_MIN)
@@ -513,14 +582,15 @@ class CalibrationScreen:
             draw_label(s, summary, SCREEN_W // 2, sr.bottom + 60,
                        self.fonts['tiny'], DIM, anchor='center')
 
-            gap = self.cal.flex_mean - self.cal.rest_mean
-            quality = "Good separation" if gap >= max(20.0, 2.5 * self.cal.rest_std) else "Weak separation"
+            quality = "Good separation" if self.cal.quality_margin >= 8.0 else "Weak separation"
             qc = GREEN if quality == "Good separation" else YELLOW
             draw_label(s, quality, SCREEN_W // 2, sr.bottom + 78,
                        self.fonts['tiny'], qc, anchor='center')
+            draw_label(s, f"EMG gate {self.cal.activation_gate:.1f} µV", SCREEN_W // 2, sr.bottom + 96,
+                       self.fonts['tiny'], BORDER, anchor='center')
 
             self._draw_big_button("SPACE = redo FLEX   G = game   R = reaction",
-                                  sr.bottom + 90, color=PANEL2, text_color=DIM)
+                                  sr.bottom + 112, color=PANEL2, text_color=DIM)
 
     def _draw_big_button(self, label: str, y: int, color=ACCENT, text_color=BG):
         w = min(540, len(label) * 11 + 40)
@@ -540,6 +610,17 @@ class CalibrationScreen:
 
         draw_label(self.surf, title, SCREEN_W // 2, 160, self.fonts['xl'], title_color, anchor='center')
         draw_label(self.surf, subtitle, SCREEN_W // 2, 208, self.fonts['med'], TEXT, anchor='center')
+        draw_label(self.surf, "Recording is active", SCREEN_W // 2, 236, self.fonts['small'], title_color,
+                   anchor='center')
+        draw_label(
+            self.surf,
+            "Do not press SPACE again during this timer.",
+            SCREEN_W // 2,
+            298,
+            self.fonts['tiny'],
+            BORDER,
+            anchor='center',
+        )
 
         countdown = max(0.0, secs_left)
         draw_label(
@@ -593,9 +674,8 @@ class MainMenu:
         self.ch_sel.draw(s, active_ch, self.fonts)
 
         # ── EMG plot ──
-        disp = self.emg.peek(DISPLAY_N)
-        self.plot.draw(s, disp, self.ctrl.threshold if self.cal.is_calibrated() else 0.0,
-                       active_ch, self.fonts)
+        disp = self.emg.peek(int(self.emg.sampling_rate * DISPLAY_SECS_UI))
+        self.plot.draw(s, disp, 0.0, active_ch, self.fonts)
 
         # ── Activation bar ──
         draw_label(s, "ACTIVATION", 30, 350, self.fonts['tiny'], DIM)
@@ -631,10 +711,11 @@ def main():
     emg = EMGInput()
     emg.start()
 
-    default_channel = next((i for i in range(emg.n_channels) if i not in DISABLED_CHANNELS), 0)
-    proc = EMGProcessor(sampling_rate=emg.sampling_rate, smooth_ms=80, channel=default_channel)
+    channel_metrics = probe_channel_metrics(emg)
+    default_channel = choose_default_channel(channel_metrics, emg.n_channels)
+    proc = EMGProcessor(sampling_rate=emg.sampling_rate, smooth_ms=90, channel=default_channel)
     cal  = Calibration()
-    ctrl = TriggerController(threshold=50.0, refractory_ms=250, release_ratio=0.65)
+    ctrl = TriggerController(threshold=50.0, refractory_ms=250, release_ratio=0.65, hold_ms=70)
 
     # Screens
     menu_scr = MainMenu(screen, fonts, cal, emg, proc, ctrl)
@@ -652,9 +733,13 @@ def main():
         f"Synthetic: {emg.synthetic}"
     )
     print(f"  {emg.n_channels} ch @ {emg.sampling_rate} Hz")
+    metrics_str = "  ".join(
+        f"CH{i+1}:{mean_abs:.1f}/{p95_abs:.1f}"
+        for i, (mean_abs, p95_abs) in enumerate(channel_metrics)
+    )
+    print(f"  Rest probe mean/p95 µV: {metrics_str}")
+    print(f"  Default channel: CH{default_channel + 1}")
     print("  C=calibrate  G=game  R=reaction  M=menu  1-4=channel")
-    if DISABLED_CHANNELS:
-        print("  Disabled channels: " + ", ".join(f"CH{i+1}" for i in sorted(DISABLED_CHANNELS)))
     print("=" * 54)
 
     running = True
@@ -720,10 +805,16 @@ def main():
                 if mode == 'calibrate':
                     cal_scr.handle_event(event)
 
-        # ── EMG: pull NEW samples only, push once ──────────────────────────────
-        new_samples = emg.pull()
-        proc.push(new_samples)
-        activation = proc.activation()
+        # ── Activation from peek() — always fresh, no pull/push timing issues ──
+        # pull()+push() fails when the LSL thread delivers chunks every ~50ms
+        # but the main loop runs at 60fps (16.7ms): most frames pull() is empty
+        # and activation stays at 0.  peek() is non-destructive and always returns
+        # the latest data buffered by the background thread.
+        _peek_n = max(proc.smooth_samples * 4, 64)
+        _disp   = emg.peek(_peek_n)
+        activation = EMGProcessor.compute_activation_from_window(
+            _disp, active_ch, proc.smooth_samples
+        )
 
         triggered = ctrl.update(activation) or manual_trigger
 
@@ -732,8 +823,7 @@ def main():
             menu_scr.run_frame(activation, active_ch)
 
         elif mode == 'calibrate':
-            # Keep active_ch in sync with proc channel
-            active_ch = proc.channel
+            active_ch = proc.channel   # keep in sync when cal screen changes channel
             cal_scr.run_frame(activation, active_ch)
 
         elif mode == 'game':
