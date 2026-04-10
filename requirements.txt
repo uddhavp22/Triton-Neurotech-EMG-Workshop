@@ -1,0 +1,6 @@
+mindrove
+numpy
+pygame
+pylsl
+pyautogui
+scipy
