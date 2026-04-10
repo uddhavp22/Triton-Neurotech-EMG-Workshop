@@ -4,3 +4,5 @@ pygame
 pylsl
 pyautogui
 scipy
+PyQt6
+pyqtgraph
